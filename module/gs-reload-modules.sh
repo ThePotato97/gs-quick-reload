@@ -427,17 +427,35 @@ acquire_reload_lock() {
     mkdir "$RELOAD_LOCK/parent" || { release_reload_lock; return 1; }
     printf '%s\n' "$current_boot" > "$RELOAD_LOCK/boot-id"
     printf 'pending\n' > "$RELOAD_LOCK/gate"
+    # Only reap directories owned by this protocol from a different kernel
+    # boot. Validate both UUID and metadata, and never follow a symlink.
+    for old_lock in "$GS_DIR"/.reload-lock-*; do
+        [ -d "$old_lock" ] && [ ! -L "$old_lock" ] || continue
+        [ "$old_lock" = "$RELOAD_LOCK" ] && continue
+        old_boot=${old_lock##*/.reload-lock-}
+        printf '%s\n' "$old_boot" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || continue
+        [ "$(cat "$old_lock/boot-id" 2>/dev/null)" = "$old_boot" ] || continue
+        rm -rf "$old_lock"
+    done
+    return 0
+}
+
+accept_restart() {
+    # Do not defer this transition to EXIT: the invoking terminal may die.
+    # Helpers retain their own markers until they finish.
+    printf 'accepted\n' > "$RELOAD_LOCK/gate" || return 1
+    release_reload_lock
 }
 
 cleanup_reload() {
     restore_boot_state
     if [ "${LOCK_HELD:-0}" = "1" ]; then
         if [ "${BOOT_HANDOFF:-0}" = "1" ]; then
-            printf 'accepted\n' > "$RELOAD_LOCK/gate"
+            accept_restart
         else
             printf 'cancelled\n' > "$RELOAD_LOCK/gate"
+            release_reload_lock
         fi
-        release_reload_lock
     fi
 }
 
@@ -925,6 +943,14 @@ trim_group() {
 }
 
 if [ "$MODE" = "trim" ]; then
+    LOCK_HELD=0
+    BOOT_CHANGED=0
+    BOOT_HANDOFF=0
+    trap 'cleanup_reload' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    acquire_reload_lock || exit 3
     echo "== 清理重复常驻实例 =="
     _pids=$(pidof lspd 2>/dev/null)
     if [ -n "$_pids" ] && [ "$(echo $_pids | wc -w)" -gt 1 ]; then
@@ -1282,7 +1308,9 @@ EOS
     echo "    --- 已挂夜间模式守护：模式=$_pm 当前昼夜=$_pd（日志 $LOGDIR/gs-night.log）"
 }
 
-night_watch_start || exit 3
+if ! night_watch_start; then
+    tlog "[!] Night helper setup failed; continuing without night-mode correction"
+fi
 
 # v13：boot_completed 看门狗（兼「边沿发生器」）。
 # 实测结论：`resetprop -w sys.boot_completed 1` 只在值发生 0→1 变化时被唤醒，
@@ -1402,6 +1430,10 @@ BOOT_HANDOFF=1
 if ! setprop ctl.restart zygote; then
     BOOT_HANDOFF=0
     echo "[X] Zygote restart request failed."
+    exit 3
+fi
+if ! accept_restart; then
+    tlog "[X] Restart requested but helper handoff could not be recorded"
     exit 3
 fi
 tlog "zygote 重启已下发，本次 reload 结束"

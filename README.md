@@ -44,17 +44,23 @@ the Zygote restart request restore the previous value. Stage-command failures
 also abort the restart. After an accepted restart request, the existing detached
 watchdog handles boot-state recovery. Restoring the property does not undo
 module scripts or mounts already applied; SIGKILL cannot run shell cleanup.
-Reloads take a per-kernel-boot directory lock, retained until the main script
-and both detached helpers finish. A second run aborts without replaying stages.
+Reloads and `trim` take the same per-kernel-boot directory lock, retained until
+the main script and both detached helpers finish. A second run aborts without
+replaying stages or trimming daemons.
 An interrupted run that cannot clean up keeps its lock for that boot; a full
-reboot uses a fresh boot-ID namespace. Lock directories from earlier
-boots are not reused or automatically deleted.
+reboot uses a fresh boot-ID namespace. After acquisition, old-boot lock
+directories are removed only if their UUID names and boot-ID metadata agree;
+symlinks and directories without matching ownership metadata are left alone.
 
 Night/boot helper wrappers detach before the restart request but wait for its
-acceptance before executing. A rejected request cancels both wrappers, restores
+acceptance before executing. Immediately after a successful request, the main
+script writes acceptance and removes its parent marker explicitly; the normal
+handoff does not rely on the EXIT trap. A rejected request cancels both wrappers, restores
 the changed boot flag, and releases the lock when they exit. All watchdog paths,
 including inline fallbacks, receive the same resolved `resetprop` executable.
-The script does not recover a missing display by restarting SurfaceFlinger.
+Failure to prepare the optional night helper is logged as a warning and does
+not block the restart. The script does not recover a missing display by
+restarting SurfaceFlinger.
 
 Known side effect: resetting `sys.boot_completed` and manufacturing a 0→1 edge
 can re-run matching Android init property actions; it is not scoped to waiting

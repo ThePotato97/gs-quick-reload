@@ -5,6 +5,7 @@
 - Detect Vector and NeoZygisk separately from LSPosed/Zygisk Next; probe the detected Vector APK directly with bounded IPC checks.
 - Restore the changed boot flag on abort, and stop on failed ksud commands.
 - Serialize reloads through helper completion; detached helpers wait for restart acceptance and cancel on rejection.
+- Record accepted handoff explicitly after the restart request, lock trim against reload, and prune only owned old-boot locks. Optional night-helper setup failure is a warning.
 - Deploy backup and legacy tmp copies during installation only, preventing runtime self-copy downgrades.
 - Pass the resolved resetprop path through all watchdog variants.
 - Match unix socket inodes by column 7, choose duplicate-process survivors by start time, validate dump IDs, and correct trim counts.

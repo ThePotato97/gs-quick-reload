@@ -300,6 +300,85 @@ cleanup_reload
         self.assertTrue((self.root / "helper-done").exists())
         self.assertFalse(list(gs.glob(".reload-lock-*")))
 
+    def test_explicit_handoff_survives_parent_sigkill(self):
+        self.env["TEST_REAL_SLEEP"] = "1"
+        gs = self.root / "gs"
+        gs.mkdir()
+        result = self.shell(f'''\nGS_DIR="{gs}"
+LOCK_HELD=0
+BOOT_CHANGED=0
+BOOT_HANDOFF=0
+acquire_reload_lock || exit 1
+launch_restart_helper boot sh -c 'while [ ! -f "$TEST_ROOT/finish-helper" ]; do sleep 1; done; echo done > "$TEST_ROOT/helper-done"'
+BOOT_HANDOFF=1
+accept_restart || exit 2
+kill -KILL $$
+''')
+        self.assertEqual(result.returncode, -9)
+        locks = list(gs.glob(".reload-lock-*"))
+        self.assertEqual(len(locks), 1)
+        self.assertFalse((locks[0] / "parent").exists())
+        self.assertEqual((locks[0] / "gate").read_text().strip(), "accepted")
+        (self.root / "finish-helper").touch()
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertTrue((self.root / "helper-done").exists())
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+
+    def test_trim_cannot_enter_during_reload(self):
+        gs = self.root / "data/adb/gs"
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        lock = gs / f".reload-lock-{boot_id}"
+        lock.mkdir(parents=True)
+        (lock / "parent").mkdir()
+        result = self.run_reload(["trim"])
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertNotIn("== 清理重复常驻实例 ==", result.stdout)
+        self.assertTrue((lock / "parent").exists())
+
+    def test_prunes_only_owned_old_boot_lock_directories(self):
+        gs = self.root / "gs"
+        gs.mkdir()
+        old_uuid = "00000000-0000-0000-0000-000000000000"
+        old = gs / f".reload-lock-{old_uuid}"
+        old.mkdir()
+        (old / "boot-id").write_text(old_uuid)
+        (old / "parent").mkdir()
+        foreign = gs / ".reload-lock-not-our-protocol"
+        foreign.mkdir()
+        mismatched = gs / ".reload-lock-11111111-1111-1111-1111-111111111111"
+        mismatched.mkdir()
+        (mismatched / "boot-id").write_text("different owner")
+        target = self.root / "symlink-target"
+        target.mkdir()
+        link = gs / ".reload-lock-22222222-2222-2222-2222-222222222222"
+        link.symlink_to(target, target_is_directory=True)
+        result = self.shell(f'\nGS_DIR="{gs}"\nLOCK_HELD=0\nacquire_reload_lock && cleanup_reload\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(old.exists())
+        self.assertTrue(foreign.exists())
+        self.assertTrue(mismatched.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(target.exists())
+
+    def test_failed_night_helper_setup_does_not_block_restart(self):
+        self.env.update(TEST_REAL_SLEEP="1", TEST_NIGHT_MODE="0")
+        gs = self.root / "data/adb/gs"
+        gs.mkdir(parents=True)
+        (gs / ".gs-night-fix.sh").mkdir()
+        result = self.run_reload()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Night helper setup failed", result.stdout)
+        self.assertIn("ctl.restart zygote", (self.root / "setprop-calls").read_text())
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.root / "boot").read_text().strip(), "1")
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+
     def test_exported_script_cannot_overwrite_backup(self):
         backup = self.root / "data/adb/gs/gs-reload-modules.sh"
         backup.parent.mkdir(parents=True)
