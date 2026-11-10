@@ -14,22 +14,40 @@ This fork adds separate handling for enabled `zygisk_vector` (Vector) and
 Disabled or removal-pending modules are ignored. Enabling both frameworks
 aborts before any boot-state change or module stage.
 
-For Vector, the reload requires exactly one `vectord` process and a successful,
-bounded response from its bundled `cli status` command. Vector builds without
-that CLI abort before replaying stages; process existence alone is not treated
-as a readiness check. The check proves daemon IPC is responding, **not** that
+For Vector, the reload requires exactly one `vectord` process and a successful
+response from its CLI API. It launches `org.matrix.vector.daemon.Cli status`
+through `app_process` with the detected module's `daemon.apk` as its explicit
+classpath. It does not use the upstream `cli` wrapper, which hardcodes the
+module directory and may select a separate debug APK. Missing APK/runtime tools
+abort before module stages; an absent CLI API or unresponsive daemon fails the
+readiness gate and restores any boot flag changed by this run.
+Each probe gets up to 10 seconds, within a 30-second polling deadline with
+progress output. Process existence alone is not treated as a readiness check.
+The check proves daemon IPC is responding, **not** that
 every app will be injected after Zygote restarts. It does not kill Vector daemons
 or blindly rerun Vector's `service.sh` to recover a failure.
 
 NeoZygisk is identified from module metadata rather than assuming that every
 `zygisksu` installation is Zygisk Next. Zygisk Next's `zn-daemon` deduplication
 is only applied to that implementation.
+Unidentified implementations are reported as `unknown` and are not subjected
+to process-killing deduplication. Zygisk Next retains its daemon-count display.
+
+LSPosed recovery remains on the `ksud` path (including `-n`, as upstream did),
+and is skipped in script-only fallback mode. Only the exact supported identities
+`zygisk_vector` and `zygisk_lsposed` select framework recovery; other fork IDs
+are not guessed from generic `daemon` text in a script. Surrounding whitespace
+in module metadata is trimmed.
 
 When this script changes `sys.boot_completed`, exits or catchable signals before
 the Zygote restart request restore the previous value. Stage-command failures
 also abort the restart. After an accepted restart request, the existing detached
 watchdog handles boot-state recovery. Restoring the property does not undo
 module scripts or mounts already applied; SIGKILL cannot run shell cleanup.
+This stop applies to a failed `ksud` command or timeout. Current
+[KernelSU-Next stage handling](https://github.com/KernelSU-Next/KernelSU-Next/blob/dev/userspace/ksud/src/init_event.rs)
+logs individual module-script errors internally; those are not automatically
+equivalent to a non-zero stage-command exit.
 
 Validation: `sh -n module/gs-reload-modules.sh` and
 `python3 -m unittest discover -s tests -v` (host mocks, no Android operations).

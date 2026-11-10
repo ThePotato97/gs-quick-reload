@@ -310,7 +310,7 @@ find_enabled_module() {
         [ -d "$module_dir" ] || continue
         [ -f "$module_dir/disable" ] && continue
         [ -f "$module_dir/remove" ] && continue
-        if tr -d '\r' < "$module_dir/module.prop" 2>/dev/null | grep -qx "id=$1"; then
+        if sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$module_dir/module.prop" 2>/dev/null | grep -qx "id=$1"; then
             echo "$module_dir"
             return 0
         fi
@@ -329,8 +329,8 @@ detect_framework() {
     [ -n "$LSPOSED_DIR" ] && FRAMEWORK_KIND=lsposed
     if [ -n "$VECTOR_DIR" ]; then
         FRAMEWORK_KIND=vector
-        if [ ! -f "$VECTOR_DIR/cli" ] || ! command -v timeout >/dev/null 2>&1; then
-            echo "[X] Vector reload needs its bundled cli and timeout for a bounded readiness check."
+        if [ ! -r "$VECTOR_DIR/daemon.apk" ] || [ ! -x /system/bin/app_process ] || ! command -v timeout >/dev/null 2>&1; then
+            echo "[X] Vector reload needs daemon.apk, app_process and timeout for a bounded readiness check."
             echo "    No boot property or module stage has been changed."
             return 1
         fi
@@ -354,17 +354,25 @@ vector_ready() {
     [ "$#" -eq 1 ] || return 1
     # This probes the daemon's IPC, not just a PID or an unrelated unix socket.
     # It does not prove injection into every app after the upcoming zygote restart.
-    timeout 3 sh "$VECTOR_DIR/cli" status >/dev/null 2>&1
+    # Do not call the cli wrapper: it hardcodes zygisk_vector and may select an
+    # unrelated /data/local/tmp/daemon.apk. Use this detected installation only.
+    timeout "${1:-10}" /system/bin/app_process \
+        "-Djava.class.path=$VECTOR_DIR/daemon.apk" /system/bin \
+        --nice-name=VectorCli org.matrix.vector.daemon.Cli status >/dev/null 2>&1
 }
 
 ensure_vector() {
-    vector_attempt=0
-    while [ "$vector_attempt" -lt 20 ]; do
-        if vector_ready; then
+    vector_deadline=$(( $(date +%s) + 30 ))
+    while :; do
+        vector_remaining=$(( vector_deadline - $(date +%s) ))
+        [ "$vector_remaining" -gt 0 ] || break
+        vector_limit=10
+        [ "$vector_remaining" -lt "$vector_limit" ] && vector_limit=$vector_remaining
+        tlog "Waiting for Vector daemon IPC (${vector_remaining}s remaining)"
+        if vector_ready "$vector_limit"; then
             tlog "Vector daemon IPC ready: vectord=$(pidof vectord 2>/dev/null)"
             return 0
         fi
-        vector_attempt=$((vector_attempt + 1))
         sleep 1
     done
     echo "[X] Vector daemon IPC is not ready or multiple vectord processes exist."
@@ -376,7 +384,14 @@ ensure_vector() {
 ensure_framework() {
     case "$FRAMEWORK_KIND" in
         vector) ensure_vector ;;
-        lsposed) ensure_lspd "${1:-}" ;;
+        lsposed)
+            # Upstream does not recover lspd in script-only fallback mode.
+            if [ -n "${KSUD:-}" ]; then
+                ensure_lspd "${1:-}"
+            else
+                tlog "LSPosed fallback: skipping daemon recovery (upstream behaviour)"
+            fi
+            ;;
         none) tlog "No enabled Vector/LSPosed module; skipping Xposed daemon gate" ;;
     esac
 }
@@ -530,7 +545,6 @@ ensure_lspd() {
     _sock=$(lspbridge_count)
     echo "    [X] 干净重启失败：lspd=[$_pids] 实例=$_n 监听=$_sock"
     tlog "!! lspd 干净重启失败: pids=[$_pids] 实例=$_n 监听=$_sock，将放弃重启 zygote"
-    LSPD_FATAL=1
     return 1
 }
 
@@ -1038,7 +1052,10 @@ for d in "$MODDIR_BASE"/*; do
     [ -f "$d/disable" ] && _st="${_st}已禁用"
     [ -f "$d/remove" ] && _st="${_st}待移除"
     case "$_id" in
-        zygisksu)     _st="${_st} implementation=$ZYGISK_KIND (see module name above)" ;;
+        zygisksu)
+            _st="${_st} implementation=$ZYGISK_KIND"
+            [ "$ZYGISK_KIND" = "zygisk-next" ] && _st="${_st} zn-daemon=${_dup_zn}"
+            ;;
         zygisk_vector) _st="${_st} Vector：vectord=$(pidof vectord 2>/dev/null)" ;;
         zygisk_lsposed) _st="${_st} LSPosed：lspd ${_dup_lspd} 个" ;;
         hma_oss_zygisk)
