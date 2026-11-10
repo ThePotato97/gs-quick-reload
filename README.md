@@ -52,6 +52,13 @@ reboot uses a fresh boot-ID namespace. After acquisition, old-boot lock
 directories are removed only if their UUID names and boot-ID metadata agree;
 symlinks and directories without matching ownership metadata are left alone.
 
+While a helper is running, both `trim` and another reload are refused. Wait for
+the helpers to finish before retrying; this can take several minutes when boot
+completion is delayed. If recording restart acceptance fails because `/data/adb`
+cannot be written, the script retries from cleanup but does not force-unlock an
+unconfirmed handoff. Helpers may not run and the current-boot lock can remain;
+a full reboot provides a fresh lock namespace and ends temporary root.
+
 Night/boot helper wrappers detach before the restart request but wait for its
 acceptance before executing. Immediately after a successful request, the main
 script writes acceptance and removes its parent marker explicitly; the normal
