@@ -7,6 +7,94 @@
 > 两个阶段，然后只重启 zygote，**跳过 `stop` / `start`**。SurfaceFlinger 全程存活，
 > 折叠屏的副屏（`port=148`）不会消失。
 
+## Vector / NeoZygisk support in this fork
+
+This fork adds separate handling for enabled `zygisk_vector` (Vector) and
+`zygisk_lsposed` (LSPosed) modules, including renamed module directories.
+Disabled or removal-pending modules are ignored. Enabling both frameworks
+aborts before any boot-state change or module stage.
+
+For Vector, the reload requires exactly one `vectord` process and a successful
+response from its CLI API. It launches `org.matrix.vector.daemon.Cli status`
+through `app_process` with the detected module's `daemon.apk` as its explicit
+classpath. It does not use the upstream `cli` wrapper, which hardcodes the
+module directory and may select a separate debug APK. Missing APK/runtime tools
+abort before module stages; an absent CLI API or unresponsive daemon fails the
+readiness gate and restores any boot flag changed by this run.
+Each probe gets up to 10 seconds, within a 30-second polling deadline with
+progress output. Process existence alone is not treated as a readiness check.
+The check proves daemon IPC is responding, **not** that
+every app will be injected after Zygote restarts. It does not kill Vector daemons
+or blindly rerun Vector's `service.sh` to recover a failure.
+
+NeoZygisk is identified from module metadata rather than assuming that every
+`zygisksu` installation is Zygisk Next. Zygisk Next's `zn-daemon` deduplication
+is only applied to that implementation.
+Unidentified implementations are reported as `unknown` and are not subjected
+to process-killing deduplication. Zygisk Next retains its daemon-count display.
+
+LSPosed recovery remains on the `ksud` path (including `-n`, as upstream did),
+and is skipped in script-only fallback mode. Only the exact supported identities
+`zygisk_vector` and `zygisk_lsposed` select framework recovery; other fork IDs
+are not guessed from generic `daemon` text in a script. Surrounding whitespace
+in module metadata is trimmed.
+
+When this script changes `sys.boot_completed`, exits or catchable signals before
+the Zygote restart request restore the previous value. Stage-command failures
+also abort the restart. After an accepted restart request, the existing detached
+watchdog handles boot-state recovery. Restoring the property does not undo
+module scripts or mounts already applied; SIGKILL cannot run shell cleanup.
+Reloads and `trim` take the same per-kernel-boot directory lock, retained until
+the main script and both detached helpers finish. A second run aborts without
+replaying stages or trimming daemons.
+An interrupted run that cannot clean up keeps its lock for that boot; a full
+reboot uses a fresh boot-ID namespace. After acquisition, old-boot lock
+directories are removed only if their UUID names and boot-ID metadata agree;
+symlinks and directories without matching ownership metadata are left alone.
+
+While a helper is running, both `trim` and another reload are refused. Wait for
+the helpers to finish before retrying; this can take several minutes when boot
+completion is delayed. If recording restart acceptance fails because `/data/adb`
+cannot be written, the script retries from cleanup but does not force-unlock an
+unconfirmed handoff. Helpers may not run and the current-boot lock can remain;
+a full reboot provides a fresh lock namespace and ends temporary root.
+
+Night/boot helper wrappers detach before the restart request but wait for its
+acceptance before executing. Immediately after a successful request, the main
+script writes acceptance and removes its parent marker explicitly; the normal
+handoff does not rely on the EXIT trap. A rejected request cancels both wrappers, restores
+the changed boot flag, and releases the lock when they exit. All watchdog paths,
+including inline fallbacks, receive the same resolved `resetprop` executable.
+Failure to prepare the optional night helper is logged as a warning and does
+not block the restart. The script does not recover a missing display by
+restarting SurfaceFlinger.
+
+Known side effect: resetting `sys.boot_completed` and manufacturing a 0→1 edge
+can re-run matching Android init property actions; it is not scoped to waiting
+module scripts. See [Android init property triggers](https://android.googlesource.com/platform/system/core/+/main/init/README.md#trigger).
+This stop applies to a failed `ksud` command or timeout. Current
+[KernelSU-Next stage handling](https://github.com/KernelSU-Next/KernelSU-Next/blob/dev/userspace/ksud/src/init_event.rs)
+logs individual module-script errors internally; those are not automatically
+equivalent to a non-zero stage-command exit.
+
+Installation refreshes both `/data/adb/gs/gs-reload-modules.sh` and the legacy
+`/data/local/tmp/gs-reload-modules.sh` copy. Running a script never copies `$0`
+over another copy. Use the installed module's Action button or its script path
+for the current version. The installer reports a failed backup/copy operation.
+
+Validation: `sh -n module/gs-reload-modules.sh` and
+`python3 -m unittest discover -s tests -v` (host mocks, no Android operations).
+**These fork changes have not been validated on a phone, including CZJ1.**
+The device-test claims in the original documentation below belong to upstream.
+
+Implementation references:
+- [Vector service startup](https://github.com/JingMatrix/Vector/blob/master/zygisk/module/service.sh)
+- [Vector daemon launcher](https://github.com/JingMatrix/Vector/blob/master/zygisk/module/daemon)
+- [Vector CLI and exit status](https://github.com/JingMatrix/Vector/blob/master/daemon/src/main/kotlin/org/matrix/vector/daemon/Cli.kt)
+- [NeoZygisk service stage](https://github.com/JingMatrix/NeoZygisk/blob/master/module/src/service.sh)
+
+---
+
 ## 适用机型：三星 Galaxy Z Fold7（专用）
 
 > **本模块专为 Z Fold7 调制。** 三星 Galaxy Z Fold7（SM-F966B），

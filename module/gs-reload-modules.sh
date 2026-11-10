@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# gs-reload-modules.sh  v21 — 让 KernelSU 模块生效，但不执行 stop/start
+# gs-reload-modules.sh  v23 — 让 KernelSU 模块生效，但不执行 stop/start
 # （随「一键重载模块 gs_quick_reload」一起分发，装在 /data/adb/modules/gs_quick_reload/）
 #
 # 背景：KernelSU 的「软重启」== ksud 的 soft_reboot()，实际序列是：
@@ -194,16 +194,8 @@ else
     LOGDIR=/data/local/tmp
     PERSIST=$LOGDIR/gs-reload.log
 fi
-if [ -f "$0" ] && [ "$0" != "$SELF_BAK" ]; then
-    cp -f "$0" "$SELF_BAK" 2>/dev/null && chmod 755 "$SELF_BAK" 2>/dev/null
-fi
-# v16：反向自愈 —— 若从 /data/adb/gs 启动而 tmp 副本被清（「悲伤压缩包」的
-#   隐藏 Root 功能会 chmod/rm -rf /data/local/tmp/*），把 tmp 副本补回来，
-#   这样模块「执行」按钮（调 /data/local/tmp/gs-reload-modules.sh）不会失效。
-if [ -f "$SELF_BAK" ] && [ ! -f /data/local/tmp/gs-reload-modules.sh ]; then
-    cp -f "$SELF_BAK" /data/local/tmp/gs-reload-modules.sh 2>/dev/null \
-        && chmod 755 /data/local/tmp/gs-reload-modules.sh 2>/dev/null
-fi
+# Copies are deployed by customize.sh during installation, never from $0 at
+# runtime. An exported or backup copy must not replace the installed version.
 
 # 落盘日志：追加一行带时间戳的记录（同时也打印到终端）
 tlog() {
@@ -302,20 +294,207 @@ run_quiet() {
     return $_rc
 }
 
+# BEGIN framework helpers
+# Detect enabled modules by identity, not a generic "daemon" string in service.sh.
+# Vector supports Xposed APIs but does not expose LSPosed's lspd/lspbridge lifecycle.
+find_enabled_module() {
+    for module_dir in "$MODDIR_BASE"/*; do
+        [ -d "$module_dir" ] || continue
+        [ -f "$module_dir/disable" ] && continue
+        [ -f "$module_dir/remove" ] && continue
+        if sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$module_dir/module.prop" 2>/dev/null | grep -qx "id=$1"; then
+            echo "$module_dir"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_framework() {
+    VECTOR_DIR=$(find_enabled_module zygisk_vector) || VECTOR_DIR=""
+    LSPOSED_DIR=$(find_enabled_module zygisk_lsposed) || LSPOSED_DIR=""
+    FRAMEWORK_KIND=none
+    if [ -n "$VECTOR_DIR" ] && [ -n "$LSPOSED_DIR" ]; then
+        echo "[X] Both Vector and LSPosed are enabled; reload aborted."
+        return 1
+    fi
+    [ -n "$LSPOSED_DIR" ] && FRAMEWORK_KIND=lsposed
+    if [ -n "$VECTOR_DIR" ]; then
+        FRAMEWORK_KIND=vector
+        if [ ! -r "$VECTOR_DIR/daemon.apk" ] || [ ! -x /system/bin/app_process ] || ! command -v timeout >/dev/null 2>&1; then
+            echo "[X] Vector reload needs daemon.apk, app_process and timeout for a bounded readiness check."
+            echo "    No boot property or module stage has been changed."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+zygisk_kind() {
+    zygisk_dir=$(find_enabled_module zygisksu) || { echo none; return; }
+    zygisk_name=$(sed -n 's/^name=//p' "$zygisk_dir/module.prop" | head -1)
+    case "$zygisk_name" in
+        *NeoZygisk*) echo neozygisk ;;
+        *"Zygisk Next"*) echo zygisk-next ;;
+        *) echo unknown ;;
+    esac
+}
+
+vector_ready() {
+    vector_pids=$(pidof vectord 2>/dev/null)
+    set -- $vector_pids
+    [ "$#" -eq 1 ] || return 1
+    # This probes the daemon's IPC, not just a PID or an unrelated unix socket.
+    # It does not prove injection into every app after the upcoming zygote restart.
+    # Do not call the cli wrapper: it hardcodes zygisk_vector and may select an
+    # unrelated /data/local/tmp/daemon.apk. Use this detected installation only.
+    timeout "${1:-10}" /system/bin/app_process \
+        "-Djava.class.path=$VECTOR_DIR/daemon.apk" /system/bin \
+        --nice-name=VectorCli org.matrix.vector.daemon.Cli status >/dev/null 2>&1
+}
+
+ensure_vector() {
+    vector_deadline=$(( $(date +%s) + 30 ))
+    while :; do
+        vector_remaining=$(( vector_deadline - $(date +%s) ))
+        [ "$vector_remaining" -gt 0 ] || break
+        vector_limit=10
+        [ "$vector_remaining" -lt "$vector_limit" ] && vector_limit=$vector_remaining
+        tlog "Waiting for Vector daemon IPC (${vector_remaining}s remaining)"
+        if vector_ready "$vector_limit"; then
+            tlog "Vector daemon IPC ready: vectord=$(pidof vectord 2>/dev/null)"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "[X] Vector daemon IPC is not ready or multiple vectord processes exist."
+    echo "    Zygote will not restart. No extra Vector service.sh or daemon kill was attempted."
+    tlog "Vector readiness failed; vectord=$(pidof vectord 2>/dev/null)"
+    return 1
+}
+
+ensure_framework() {
+    case "$FRAMEWORK_KIND" in
+        vector) ensure_vector ;;
+        lsposed)
+            # Upstream does not recover lspd in script-only fallback mode.
+            if [ -n "${KSUD:-}" ]; then
+                ensure_lspd "${1:-}"
+            else
+                tlog "LSPosed fallback: skipping daemon recovery (upstream behaviour)"
+            fi
+            ;;
+        none) tlog "No enabled Vector/LSPosed module; skipping Xposed daemon gate" ;;
+    esac
+}
+
+# Restore only the property this run changed, and only before restart handoff.
+# Module stages cannot be rolled back by restoring this flag.
+restore_boot_state() {
+    if [ "${BOOT_CHANGED:-0}" = "1" ] && [ "${BOOT_HANDOFF:-0}" = "0" ]; then
+        if "$BOOT_RESETPROP" sys.boot_completed "$BOOT_ORIGINAL"; then
+            BOOT_CHANGED=0
+            tlog "Abort cleanup: restored sys.boot_completed=$BOOT_ORIGINAL; module stages may have run"
+        else
+            echo "[X] Failed to restore sys.boot_completed=$BOOT_ORIGINAL" >&2
+        fi
+    fi
+    return 0
+}
+
+release_reload_lock() {
+    [ "${LOCK_HELD:-0}" = "1" ] || return 0
+    rmdir "$RELOAD_LOCK/parent" 2>/dev/null || true
+    if [ ! -d "$RELOAD_LOCK/night" ] && [ ! -d "$RELOAD_LOCK/boot" ]; then
+        rm -f "$RELOAD_LOCK/gate" "$RELOAD_LOCK/boot-id"
+        rmdir "$RELOAD_LOCK" 2>/dev/null || true
+    fi
+    LOCK_HELD=0
+}
+
+acquire_reload_lock() {
+    current_boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    [ -n "$current_boot" ] || return 1
+    # The kernel boot ID gives interrupted runs a fresh lock namespace after a
+    # full reboot, without racing to delete a lock that another run just took.
+    RELOAD_LOCK=$GS_DIR/.reload-lock-$current_boot
+    if ! mkdir "$RELOAD_LOCK" 2>/dev/null; then
+        echo "[X] Another reload or detached helper is active, or an interrupted run holds the lock."
+        echo "    Lock: $RELOAD_LOCK (a full reboot uses a fresh lock)."
+        return 1
+    fi
+    LOCK_HELD=1
+    mkdir "$RELOAD_LOCK/parent" || { release_reload_lock; return 1; }
+    printf '%s\n' "$current_boot" > "$RELOAD_LOCK/boot-id"
+    printf 'pending\n' > "$RELOAD_LOCK/gate"
+    # Only reap directories owned by this protocol from a different kernel
+    # boot. Validate both UUID and metadata, and never follow a symlink.
+    for old_lock in "$GS_DIR"/.reload-lock-*; do
+        [ -d "$old_lock" ] && [ ! -L "$old_lock" ] || continue
+        [ "$old_lock" = "$RELOAD_LOCK" ] && continue
+        old_boot=${old_lock##*/.reload-lock-}
+        printf '%s\n' "$old_boot" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || continue
+        [ "$(cat "$old_lock/boot-id" 2>/dev/null)" = "$old_boot" ] || continue
+        rm -rf "$old_lock"
+    done
+    return 0
+}
+
+accept_restart() {
+    # Do not defer this transition to EXIT: the invoking terminal may die.
+    # Helpers retain their own markers until they finish.
+    printf 'accepted\n' > "$RELOAD_LOCK/gate" || return 1
+    release_reload_lock
+}
+
+cleanup_reload() {
+    restore_boot_state
+    if [ "${LOCK_HELD:-0}" = "1" ]; then
+        if [ "${BOOT_HANDOFF:-0}" = "1" ]; then
+            accept_restart
+        else
+            printf 'cancelled\n' > "$RELOAD_LOCK/gate"
+            release_reload_lock
+        fi
+    fi
+}
+
+# Helpers detach before restart so HUP cannot kill them, but do no work until
+# the restart is accepted. On a rejected request they exit without mutations.
+# Their markers keep the run lock alive until both helpers have finished.
+launch_restart_helper() {
+    helper_name=$1
+    shift
+    command -v setsid >/dev/null 2>&1 || return 1
+    mkdir "$RELOAD_LOCK/$helper_name" || return 1
+    setsid sh -c '
+        lock=$1; marker=$2; shift 2
+        done_helper() {
+            rmdir "$lock/$marker" 2>/dev/null || true
+            if [ ! -d "$lock/parent" ] && [ ! -d "$lock/night" ] && [ ! -d "$lock/boot" ]; then
+                rm -f "$lock/gate" "$lock/boot-id"
+                rmdir "$lock" 2>/dev/null || true
+            fi
+        }
+        trap done_helper 0
+        waited=0
+        while :; do
+            gate=$(cat "$lock/gate" 2>/dev/null) || exit 1
+            case "$gate" in accepted) break ;; cancelled) exit 0 ;; esac
+            [ "$waited" -lt 60 ] || exit 1
+            sleep 1
+            waited=$((waited+1))
+        done
+        "$@"
+    ' sh "$RELOAD_LOCK" "$helper_name" "$@" </dev/null >/dev/null 2>&1 &
+}
+# END framework helpers
+
 # v9：按 module.prop 的 id 找 LSPosed 模块目录，不再硬编码目录名。
 #   KernelSU 允许模块目录名与 id 不同（实测本机出现了 /data/adb/modules/m_rcq
 #   这类与 id 不一致的目录），硬编码 zygisk_lsposed 会找不到。
 find_lsposed_dir() {
-    for d in "$MODDIR_BASE"/*; do
-        [ -d "$d" ] || continue
-        if grep -qs '^id=zygisk_lsposed' "$d/module.prop" 2>/dev/null; then echo "$d"; return 0; fi
-    done
-    # 退一步：任何 service.sh 里出现 lspd/daemon 的目录
-    for d in "$MODDIR_BASE"/*; do
-        [ -f "$d/service.sh" ] || continue
-        if grep -qs 'lspd\|LSPOSED\|daemon' "$d/service.sh" 2>/dev/null; then echo "$d"; return 0; fi
-    done
-    return 1
+    find_enabled_module zygisk_lsposed
 }
 
 # v15：找出「依赖 sys.boot_completed 0→1 边沿」的模块。
@@ -445,7 +624,6 @@ ensure_lspd() {
     _sock=$(lspbridge_count)
     echo "    [X] 干净重启失败：lspd=[$_pids] 实例=$_n 监听=$_sock"
     tlog "!! lspd 干净重启失败: pids=[$_pids] 实例=$_n 监听=$_sock，将放弃重启 zygote"
-    LSPD_FATAL=1
     return 1
 }
 
@@ -584,7 +762,7 @@ fi
 # ------------------------------------------------------------------ run 模式
 if [ "$(id -u)" != "0" ]; then
     echo "[!] 需要 root。请在 GhostSam 内置终端里执行："
-    echo "      sh /data/local/tmp/gs-reload-modules.sh"
+    echo "      sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh"
     exit 1
 fi
 
@@ -638,6 +816,9 @@ if [ "$MODE" = "dump" ]; then
         echo "现有模块: $(ls "$MODDIR_BASE" 2>/dev/null | tr '\n' ' ')"
         exit 2
     fi
+    case "$DUMP_ID" in
+        *[!a-zA-Z0-9_.-]*|.|..) echo "[X] Invalid module id"; exit 2 ;;
+    esac
     _src="$MODDIR_BASE/$DUMP_ID"
     if [ ! -d "$_src" ]; then
         echo "[!] 没有这个目录: $_src"
@@ -679,7 +860,8 @@ dedupe_new() {
         echo "    --- dedupe $_dn: 清理本次新增 [$_new]（原有实例仍在，保留）"
         tlog "dedupe: $_dn 新增 [$_new] 已清理"
     else
-        _keep=$(echo $_new | awk '{print $NF}')
+        _keep=$(lspd_newest "$_new")
+        [ -n "$_keep" ] || { tlog "dedupe: no readable process start times; skipping $_dn"; return 0; }
         for p in $_new; do
             [ "$p" = "$_keep" ] && continue
             kill "$p" 2>/dev/null
@@ -708,7 +890,7 @@ socket_owner() {
                     # v17：只认**监听中**的 socket（/proc/net/unix 第 4 列 Flags=00010000）。
                     # v16 只比对 inode，结果把某个随便的 socket 当成了持有者，
                     # trim 掉真正的 zn-daemon 后 Zygisk 注入全部 111 拒绝。
-                    if awk -v i="$ino" '{for(k=1;k<=NF;k++) if($k==i && $4=="00010000"){f=1}} END{exit !f}' /proc/net/unix 2>/dev/null; then
+                    if awk -v i="$ino" '$7==i && $4=="00010000" {f=1} END{exit !f}' /proc/net/unix 2>/dev/null; then
                         echo "$p"; return 0
                     fi
                     ;;
@@ -754,11 +936,21 @@ trim_group() {
         [ "$p" = "$_keep" ] && continue
         [ -d "/proc/$p" ] && kill -9 "$p" 2>/dev/null
     done
-    echo "    --- 处理后：$(echo $_pids | wc -w) → $(pidof $_name 2>/dev/null | wc -w | tr -d ' ') 个"
+    _remaining=0
+    for p in $_pids; do [ -d "/proc/$p" ] && _remaining=$((_remaining+1)); done
+    echo "    --- 处理后：$(echo $_pids | wc -w) → $_remaining 个"
     return 0
 }
 
 if [ "$MODE" = "trim" ]; then
+    LOCK_HELD=0
+    BOOT_CHANGED=0
+    BOOT_HANDOFF=0
+    trap 'cleanup_reload' 0
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    acquire_reload_lock || exit 3
     echo "== 清理重复常驻实例 =="
     _pids=$(pidof lspd 2>/dev/null)
     if [ -n "$_pids" ] && [ "$(echo $_pids | wc -w)" -gt 1 ]; then
@@ -797,6 +989,20 @@ if [ "$(getprop sys.boot_completed)" != "1" ]; then
     echo "[!] 系统未完成启动，先别动"
     exit 1
 fi
+
+# Validate the installed framework before replaying stages or changing boot state.
+detect_framework || exit 3
+ZYGISK_KIND=$(zygisk_kind)
+BOOT_ORIGINAL=$(getprop sys.boot_completed)
+BOOT_CHANGED=0
+BOOT_HANDOFF=0
+BOOT_RESETPROP=""
+LOCK_HELD=0
+trap 'cleanup_reload' 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+acquire_reload_lock || exit 3
 
 # 兜底：逐模块跑脚本（不做挂载）。输出同样走文件，避免后台 daemon 占住管道。
 run_one() {
@@ -852,7 +1058,14 @@ else
     if [ "$DO_ZYGOTE" = "1" ]; then
         _rp=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
         if [ -x "$_rp" ]; then
+            BOOT_RESETPROP=$_rp
+            BOOT_CHANGED=1
             "$_rp" sys.boot_completed 0 2>/dev/null
+            _boot_rc=$?
+            if [ "$_boot_rc" -ne 0 ] || [ "$(getprop sys.boot_completed)" != "0" ]; then
+                echo "[X] Could not reset boot state; aborting before module stages."
+                exit 3
+            fi
             echo "    --- 已置 sys.boot_completed=0（供依赖启动阶段的模块使用）"
             tlog "resetprop sys.boot_completed 0（模拟 ksud soft_reboot 的启动阶段切换）"
         else
@@ -868,6 +1081,10 @@ else
     _rc=$?
     echo "    exit=$_rc"
     tlog "stage post-fs-data 结束 exit=$_rc 累计=$(( $(date +%s) - T0 ))s"
+    if [ "$_rc" -ne 0 ]; then
+        echo "[X] post-fs-data failed; zygote will not restart."
+        exit "$_rc"
+    fi
     tlog "modules: $(ls "$MODDIR_BASE" 2>/dev/null | tr '\n' ' ')"
 
     echo
@@ -895,21 +1112,27 @@ else
     _rc=$?
     echo "    exit=$_rc"
     tlog "stage services 结束 exit=$_rc 累计=$(( $(date +%s) - T0 ))s"
+    if [ "$_rc" -ne 0 ]; then
+        echo "[X] services failed; zygote will not restart."
+        exit "$_rc"
+    fi
     # v20：lspd 绝对不能走 dedupe（"留旧杀新"会和 `daemon --force` 互撞，
     # 结果是新旧全没）。zn-daemon 没有这个语义，照旧只清本次新增。
-    dedupe_new zn-daemon "$_snap_zn"
+    [ "$ZYGISK_KIND" = "zygisk-next" ] && dedupe_new zn-daemon "$_snap_zn"
 
     echo
-    echo "==== lspd 健康检查（必须有一个、且 lspbridge 在监听）===="
-    tlog "services 前 lspd 快照: [$_snap_lspd]"
-    ensure_lspd "$_snap_lspd"
+    echo "==== Xposed daemon readiness: $FRAMEWORK_KIND / $ZYGISK_KIND ===="
 fi
+
+# Apply the same readiness gate to the fallback path. Vector is never passed to
+# LSPosed's lspd recovery or duplicate-process cleanup.
+ensure_framework "${_snap_lspd:-}" || exit 3
 
 echo
 echo "== 模块脚本是否跑起来（看进程）=="
 _dup_lspd=$(pidof lspd 2>/dev/null | wc -w | tr -d ' ')
 _dup_zn=$(pidof zn-daemon 2>/dev/null | wc -w | tr -d ' ')
-ps -A -o NAME 2>/dev/null | grep -iE 'lspd|yhyc|zygiskd|sulogd|zn-daemon' | sort | uniq -c | sed 's/^/    /' || echo "    (无)"
+ps -A -o NAME 2>/dev/null | grep -iE 'lspd|vectord|yhyc|zygiskd|zygisk-ptrace|sulogd|zn-daemon' | sort | uniq -c | sed 's/^/    /' || echo "    (无)"
 [ "$_dup_lspd" -gt 1 ] 2>/dev/null && echo "    [!] lspd 有 $_dup_lspd 个实例，应为 1 个"
 
 echo
@@ -924,7 +1147,11 @@ for d in "$MODDIR_BASE"/*; do
     [ -f "$d/disable" ] && _st="${_st}已禁用"
     [ -f "$d/remove" ] && _st="${_st}待移除"
     case "$_id" in
-        zygisksu)     _st="${_st} Zygisk Next：zn-daemon ${_dup_zn} 个" ;;
+        zygisksu)
+            _st="${_st} implementation=$ZYGISK_KIND"
+            [ "$ZYGISK_KIND" = "zygisk-next" ] && _st="${_st} zn-daemon=${_dup_zn}"
+            ;;
+        zygisk_vector) _st="${_st} Vector：vectord=$(pidof vectord 2>/dev/null)" ;;
         zygisk_lsposed) _st="${_st} LSPosed：lspd ${_dup_lspd} 个" ;;
         hma_oss_zygisk)
             _hj=""
@@ -943,6 +1170,7 @@ if [ -d "$MODDIR_BASE/bszip" ]; then
 fi
 
 echo
+if [ "$FRAMEWORK_KIND" = "lsposed" ]; then
 echo "== LSPosed 握手检查 =="
 _pid=$(pidof lspd 2>/dev/null)
 if [ -r /proc/net/unix ]; then
@@ -958,6 +1186,12 @@ if [ -z "$_pid" ]; then
     echo "    [!] lspd 没在跑，重启 zygote 后 LSPosed 会 Connection refused"
     echo "        改用：setsid sh /data/adb/modules/zygisk_lsposed/service.sh </dev/null >/dev/null 2>&1 &"
     tlog "警告: lspd 未运行"
+fi
+else
+    echo "== Xposed daemon =="
+    echo "    framework=$FRAMEWORK_KIND zygisk=$ZYGISK_KIND vectord=$(pidof vectord 2>/dev/null)"
+    echo "    Vector is not tested using lspd/lspbridge or zn-daemon."
+    _pid=""
 fi
 
 echo
@@ -1003,7 +1237,7 @@ night_watch_start() {
     _pd=$(dumpsys uimode 2>/dev/null | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
     [ -z "$_pd" ] && _pd=false
 
-    cat > "$NIGHT_HELPER" <<'EOS'
+    cat > "$NIGHT_HELPER" <<'EOS' || return 1
 #!/system/bin/sh
 # v21 夜间模式纠偏守护
 #   MODE = 用户原本的模式（0 自动 / 3 定时 / 1 浅色 / 2 深色）
@@ -1070,11 +1304,13 @@ else
 fi
 EOS
     chmod 755 "$NIGHT_HELPER" 2>/dev/null
-    setsid sh "$NIGHT_HELPER" "$_pm" "$_pd" "$LOGDIR/gs-night.log" </dev/null >/dev/null 2>&1 &
+    launch_restart_helper night sh "$NIGHT_HELPER" "$_pm" "$_pd" "$LOGDIR/gs-night.log" || return 1
     echo "    --- 已挂夜间模式守护：模式=$_pm 当前昼夜=$_pd（日志 $LOGDIR/gs-night.log）"
 }
 
-night_watch_start
+if ! night_watch_start; then
+    tlog "[!] Night helper setup failed; continuing without night-mode correction"
+fi
 
 # v13：boot_completed 看门狗（兼「边沿发生器」）。
 # 实测结论：`resetprop -w sys.boot_completed 1` 只在值发生 0→1 变化时被唤醒，
@@ -1085,11 +1321,12 @@ night_watch_start
 #   「还有没有 resetprop -w 卡着」—— 模块无关，喂到了等待者自己会退出。
 # 看门狗用 setsid 脱离会话，zygote 重启后依然存活。
 boot_watchdog_start() {
-    cat > "$BOOT_WD" <<'EOS'
+    _boot_written=1
+    cat > "$BOOT_WD" <<'EOS' || _boot_written=0
 #!/system/bin/sh
 LOG=${1:-/data/local/tmp/gs-boot-wd.log}
 WAITERS=${2:-}
-RP=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
+RP=$3
 log() { echo "[$(date +%m-%d' '%H:%M:%S)] $*" >> "$LOG"; chmod 644 "$LOG" 2>/dev/null; }
 perm() { p=$(stat -c %a "$1" 2>/dev/null); case "$p" in ''|*[!0-9]*) echo "$p" ;; *) printf "%03d" "$p" ;; esac; }
 blocked() {
@@ -1155,41 +1392,50 @@ log "结束：等待者残留=$(blocked)，/proc/modules=$(perm /proc/modules)�
 EOS
     chmod 755 "$BOOT_WD" 2>/dev/null
     _ws=$(boot_waiters | tr '\n' ' ')
+    _watch_rp=${BOOT_RESETPROP:-}
+    [ -n "$_watch_rp" ] || _watch_rp=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
+    if [ ! -x "$_watch_rp" ]; then
+        tlog "[X] Cannot start boot watchdog: resetprop not executable: $_watch_rp"
+        return 1
+    fi
     # v18：先确认 helper 真的落盘了，否则启动只会静默失败（20:47 那次就丢了日志）
-    if [ ! -s "$BOOT_WD" ]; then
+    if [ "$_boot_written" = "0" ] || [ ! -f "$BOOT_WD" ] || [ ! -s "$BOOT_WD" ]; then
         echo "    [!] 看门狗脚本没写成（$BOOT_WD 为空），改走内联安全网"
         tlog "警告: $BOOT_WD 写入失败，退回内联安全网"
-        setsid sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && /data/adb/ksu/bin/resetprop sys.boot_completed 1' </dev/null >/dev/null 2>&1 &
+        launch_restart_helper boot sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && "$1" sys.boot_completed 1' sh "$_watch_rp" || return 1
         return 0
     fi
     if [ -z "$_ws" ]; then
         # 没有等待者时不需要边沿，只挂一条最小的安全网（卡 0 会拖到冷重启）
-        setsid sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && /data/adb/ksu/bin/resetprop sys.boot_completed 1' </dev/null >/dev/null 2>&1 &
+        launch_restart_helper boot sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && "$1" sys.boot_completed 1' sh "$_watch_rp" || return 1
         echo "    --- 无依赖 boot_completed 的模块，只挂 90s 安全网"
         tlog "watchdog: 无等待者，跳过边沿制造（仅安全网）"
         return 0
     fi
-    setsid sh "$BOOT_WD" "$LOGDIR/gs-boot-wd.log" "$_ws" </dev/null >>"$LOGDIR/gs-boot-wd.err" 2>&1 &
+    launch_restart_helper boot sh "$BOOT_WD" "$LOGDIR/gs-boot-wd.log" "$_ws" "$_watch_rp" || return 1
     echo "    --- 已挂 boot_completed 看门狗（等待模块：$_ws｜日志 $LOGDIR/gs-boot-wd.log）"
 }
 
-# v20：lspd 不健康就绝不重启 zygote。
-#   重启后 zygote 会拿着新 uuid 去连 lspbridge，连不上就是 111 刷屏、所有模块失效，
-#   而那时终端已经断开，只能再点一次「执行」—— 这就是「要点两次才生效」的由来。
-#   宁可这一次什么也不做，也不要把手机留在无注入状态。
-if [ "${LSPD_FATAL:-0}" = "1" ]; then
-    echo
-    echo "[X] lspd 不健康，已放弃重启 zygote（当前系统状态未被改动）"
-    echo "    日志：$PERSIST"
-    tlog "中止: lspd 不健康，未重启 zygote"
-    exit 3
+# Framework readiness was checked immediately after module stages, before any
+# night-mode helper was launched. An abort there runs restore_boot_state.
+if [ "$DO_ZYGOTE" = "1" ]; then
+    boot_watchdog_start || exit 3
 fi
-
-[ "$DO_ZYGOTE" = "1" ] && boot_watchdog_start
 
 echo "[*] 重启 zygote ..."
 tlog "下发 setprop ctl.restart zygote（累计 $(( $(date +%s) - T0 ))s）"
-setprop ctl.restart zygote
+# Transfer boot-state recovery to the detached watchdog before the terminal can
+# receive HUP. If init rejects the request, the EXIT trap still restores it.
+BOOT_HANDOFF=1
+if ! setprop ctl.restart zygote; then
+    BOOT_HANDOFF=0
+    echo "[X] Zygote restart request failed."
+    exit 3
+fi
+if ! accept_restart; then
+    tlog "[X] Restart requested but helper handoff could not be recorded"
+    exit 3
+fi
 tlog "zygote 重启已下发，本次 reload 结束"
 echo "[+] 已下发。终端会立即断开，约 10-20 秒回到锁屏。"
 echo "    副屏不应受影响；若断开后副屏黑了，说明走的是 stop/start 那条路。"
