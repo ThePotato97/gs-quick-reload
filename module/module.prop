@@ -1,6 +1,6 @@
 id=gs_quick_reload
 name=一键重载模块（Fold7）
-version=v2.2
-versionCode=4
-author=CodeFishK
+version=v2.3-vector
+versionCode=5
+author=CodeFishK, ThePotato97
 description=三星 Galaxy Z Fold7 专用（SM-F966B / One UI 9 / Android 17）：点「执行」让 KernelSU 模块生效，走 ksud 两阶段 + 只重启 zygote，不执行 stop/start，折叠屏副屏不会掉。附带 check 体检、mods 清单、dump 打包、trim 清理、night 还原夜间模式。基于 GhostSam 临时 root（https://github.com/snothin/GhostSam）实测。

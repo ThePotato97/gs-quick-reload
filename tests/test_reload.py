@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 SOURCE = Path(__file__).resolve().parents[1] / "module/gs-reload-modules.sh"
@@ -25,8 +26,8 @@ class ReloadTests(unittest.TestCase):
             "TEST_ROOT": str(self.root),
         }
         (self.root / "boot").write_text("1\n")
-        self.command("pidof", 'case "$1" in vectord) echo "${TEST_VECTOR_PIDS-101}";; lspd) echo "${TEST_LSPD_PIDS-}";; esac\n')
-        self.command("sleep", "exit 0\n")
+        self.command("pidof", 'case "$1" in vectord) echo "${TEST_VECTOR_PIDS-101}";; lspd) echo "${TEST_LSPD_PIDS-}";; zn-daemon) echo "${TEST_ZN_PIDS-}";; esac\n')
+        self.command("sleep", '[ "${TEST_REAL_SLEEP:-0}" = 1 ] && /bin/sleep 0.01\nexit 0\n')
         self.command("date", '''if [ "$1" = "+%s" ]; then
     clock=$(cat "$TEST_ROOT/clock" 2>/dev/null || echo 1000)
     echo "$clock"
@@ -36,7 +37,7 @@ else
 fi
 ''')
         self.command("getprop", 'case "$1" in sys.boot_completed) cat "$TEST_ROOT/boot";; esac\n')
-        self.command("resetprop", 'printf "%s\\n" "$2" > "$TEST_ROOT/boot"\n')
+        self.command("resetprop", 'printf "%s\\n" "$2" >> "$TEST_ROOT/boot-writes"\nprintf "%s\\n" "$2" > "$TEST_ROOT/boot"\n')
         self.command("app_process", '''printf '%s\\n' "$@" >> "$TEST_ROOT/app-process-args"
 case "$1" in -Djava.class.path=*) apk=${1#*=};; *) exit 91;; esac
 [ -r "$apk" ] || exit 92
@@ -74,8 +75,9 @@ exit "${TEST_VECTOR_CLI_RC:-0}"
         # Rewrite Android paths only in this disposable copy; all mutations stay
         # inside the temporary fixture. Init control is captured, never executed.
         self.command("id", 'echo 0\n')
-        self.command("setprop", 'echo "$*" >> "$TEST_ROOT/setprop-calls"\n')
-        self.command("settings", 'echo 2\n')
+        self.command("setprop", 'echo "$*" >> "$TEST_ROOT/setprop-calls"\nexit "${TEST_SETPROP_RC:-0}"\n')
+        self.command("settings", 'echo "${TEST_NIGHT_MODE:-2}"\n')
+        self.command("cmd", 'echo "$*" >> "$TEST_ROOT/cmd-calls"\n')
         self.command("logcat", 'exit 0\n')
         self.command("dumpsys", 'exit 0\n')
         self.command("ps", 'exit 0\n')
@@ -220,6 +222,137 @@ kill -TERM $$
 ''')
         self.assertEqual(result.returncode, 143)
         self.assertEqual((self.root / "boot").read_text().strip(), "1")
+
+    def test_existing_run_lock_rejects_second_run_without_stages(self):
+        gs = self.root / "data/adb/gs"
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        lock = gs / f".reload-lock-{boot_id}"
+        lock.mkdir(parents=True)
+        (lock / "parent").mkdir()
+        result = self.run_reload(["-n"])
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn("stage post-fs-data", result.stdout)
+        self.assertTrue((lock / "parent").exists())
+        self.assertEqual((self.root / "boot").read_text().strip(), "1")
+
+    def test_rejected_restart_cancels_helpers_and_restores_flag(self):
+        self.env.update(TEST_SETPROP_RC="1", TEST_NIGHT_MODE="0", TEST_REAL_SLEEP="1")
+        result = self.run_reload()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        # Detached wrappers must see cancellation before executing either helper.
+        gs = self.root / "data/adb/gs"
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+        self.assertFalse((self.root / "cmd-calls").exists())
+        self.assertEqual((self.root / "boot-writes").read_text().splitlines(), ["0", "1"])
+
+    def test_watchdog_uses_resolved_resetprop_in_both_fallbacks(self):
+        self.env["TEST_REAL_SLEEP"] = "1"
+        # Missing canonical resetprop is intentional: only the PATH command
+        # exists. A directory at the helper path also forces write-failure mode.
+        gs = self.root / "data/adb/gs"
+        gs.mkdir(parents=True)
+        (gs / ".gs-boot-wd.sh").mkdir()
+        result = self.run_reload()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.root / "boot-writes").read_text().splitlines(), ["0", "1"])
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+
+    def test_no_waiters_watchdog_uses_resolved_resetprop(self):
+        self.env["TEST_REAL_SLEEP"] = "1"
+        result = self.run_reload()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        gs = self.root / "data/adb/gs"
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertEqual((self.root / "boot-writes").read_text().splitlines(), ["0", "1"])
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+
+    def test_accepted_helper_holds_lock_until_completion(self):
+        self.env["TEST_REAL_SLEEP"] = "1"
+        gs = self.root / "gs"
+        gs.mkdir()
+        result = self.shell(f'''\nGS_DIR="{gs}"
+LOCK_HELD=0
+BOOT_CHANGED=0
+BOOT_HANDOFF=0
+acquire_reload_lock || exit 1
+launch_restart_helper boot sh -c 'while [ ! -f "$TEST_ROOT/finish-helper" ]; do sleep 1; done; echo done > "$TEST_ROOT/helper-done"'
+BOOT_HANDOFF=1
+cleanup_reload
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list(gs.glob(".reload-lock-*"))), 1)
+        (self.root / "finish-helper").touch()
+        for _ in range(100):
+            if not list(gs.glob(".reload-lock-*")):
+                break
+            time.sleep(0.01)
+        self.assertTrue((self.root / "helper-done").exists())
+        self.assertFalse(list(gs.glob(".reload-lock-*")))
+
+    def test_exported_script_cannot_overwrite_backup(self):
+        backup = self.root / "data/adb/gs/gs-reload-modules.sh"
+        backup.parent.mkdir(parents=True)
+        backup.write_text("newer installed backup\n")
+        result = self.run_reload(["-n"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(backup.read_text(), "newer installed backup\n")
+
+    def test_install_refreshes_backup_and_legacy_tmp_copy(self):
+        package = self.root / "package"
+        package.mkdir()
+        (package / "gs-reload-modules.sh").write_text("fresh package\n")
+        legacy = self.root / "data/local/tmp/gs-reload-modules.sh"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("old copy\n")
+        installer = (SOURCE.parent / "customize.sh").read_text().replace("/data/", f"{self.root}/data/").replace("/sdcard/", f"{self.root}/sdcard/")
+        path = self.root / "customize.sh"
+        path.write_text(installer)
+        result = subprocess.run(["sh", "-c", 'ui_print() { :; }; set_perm_recursive() { :; }; set_perm() { :; }; . "$1"', "sh", str(path)],
+                                env=self.env | {"MODPATH": str(package)}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(legacy.read_text(), "fresh package\n")
+        self.assertEqual((self.root / "data/adb/gs/gs-reload-modules.sh").read_text(), "fresh package\n")
+
+    def test_socket_owner_matches_inode_column_only(self):
+        proc = self.root / "proc"
+        fd = proc / "301/fd"
+        fd.mkdir(parents=True)
+        (fd / "0").symlink_to("socket:[456]")
+        net = proc / "net/unix"
+        net.parent.mkdir()
+        fn = re.search(r"(?ms)^socket_owner\(\) \{\n.*?^\}", SCRIPT).group().replace("/proc/", f"{proc}/")
+        self.env["TEST_LSPD_PIDS"] = "301"
+        net.write_text("0000: 456 0 00010000 0001 01 999 @other\n")
+        result = self.shell('\n' + fn + '\nsocket_owner lspd\n')
+        self.assertNotEqual(result.returncode, 0)
+        net.write_text("0000: 1 0 00010000 0001 01 456 @correct\n")
+        result = self.shell('\n' + fn + '\nsocket_owner lspd\n')
+        self.assertEqual(result.stdout.strip(), "301")
+
+    def test_dedupe_uses_start_time_not_pidof_order(self):
+        proc = self.root / "proc"
+        for pid, start in ((202, 500), (101, 100)):
+            path = proc / str(pid)
+            path.mkdir(parents=True)
+            (path / "stat").write_text(" ".join([str(pid), "(daemon)", "S"] + ["0"] * 18 + [str(start)]))
+        funcs = '\n'.join(re.search(r"(?ms)^" + name + r"\(\) \{\n.*?^\}", SCRIPT).group()
+                          for name in ("lspd_newest", "dedupe_new")).replace("/proc/", f"{proc}/")
+        self.env["TEST_ZN_PIDS"] = "202 101"
+        result = self.shell('\n' + funcs + '\nkill() { echo "kill:$*"; }\ndedupe_new zn-daemon ""\n')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("kill:101", result.stdout)
+        self.assertNotIn("kill:202", result.stdout)
 
 
 if __name__ == "__main__":

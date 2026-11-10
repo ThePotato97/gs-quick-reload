@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.3-vector — Vector support and reload cleanup (versionCode 5)
+
+- Detect Vector and NeoZygisk separately from LSPosed/Zygisk Next; probe the detected Vector APK directly with bounded IPC checks.
+- Restore the changed boot flag on abort, and stop on failed ksud commands.
+- Serialize reloads through helper completion; detached helpers wait for restart acceptance and cancel on rejection.
+- Deploy backup and legacy tmp copies during installation only, preventing runtime self-copy downgrades.
+- Pass the resolved resetprop path through all watchdog variants.
+- Match unix socket inodes by column 7, choose duplicate-process survivors by start time, validate dump IDs, and correct trim counts.
+- Pin release tooling, ignore Python caches, and point fork support links to ThePotato97.
+- Host regression tests only; not validated on a phone. Boot property edges can replay matching Android init actions.
+
 ## v2.2 —— 机型定位与系统版本订正（versionCode 4）
 
 **修正说明文字**：系统实际为 **Android 17（One UI 9）**，面向机型明确为 **三星 Galaxy Z Fold7**。

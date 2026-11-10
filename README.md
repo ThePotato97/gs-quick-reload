@@ -44,10 +44,30 @@ the Zygote restart request restore the previous value. Stage-command failures
 also abort the restart. After an accepted restart request, the existing detached
 watchdog handles boot-state recovery. Restoring the property does not undo
 module scripts or mounts already applied; SIGKILL cannot run shell cleanup.
+Reloads take a per-kernel-boot directory lock, retained until the main script
+and both detached helpers finish. A second run aborts without replaying stages.
+An interrupted run that cannot clean up keeps its lock for that boot; a full
+reboot uses a fresh boot-ID namespace. Lock directories from earlier
+boots are not reused or automatically deleted.
+
+Night/boot helper wrappers detach before the restart request but wait for its
+acceptance before executing. A rejected request cancels both wrappers, restores
+the changed boot flag, and releases the lock when they exit. All watchdog paths,
+including inline fallbacks, receive the same resolved `resetprop` executable.
+The script does not recover a missing display by restarting SurfaceFlinger.
+
+Known side effect: resetting `sys.boot_completed` and manufacturing a 0→1 edge
+can re-run matching Android init property actions; it is not scoped to waiting
+module scripts. See [Android init property triggers](https://android.googlesource.com/platform/system/core/+/main/init/README.md#trigger).
 This stop applies to a failed `ksud` command or timeout. Current
 [KernelSU-Next stage handling](https://github.com/KernelSU-Next/KernelSU-Next/blob/dev/userspace/ksud/src/init_event.rs)
 logs individual module-script errors internally; those are not automatically
 equivalent to a non-zero stage-command exit.
+
+Installation refreshes both `/data/adb/gs/gs-reload-modules.sh` and the legacy
+`/data/local/tmp/gs-reload-modules.sh` copy. Running a script never copies `$0`
+over another copy. Use the installed module's Action button or its script path
+for the current version. The installer reports a failed backup/copy operation.
 
 Validation: `sh -n module/gs-reload-modules.sh` and
 `python3 -m unittest discover -s tests -v` (host mocks, no Android operations).

@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # KernelSU 安装脚本：只做权限设置与初始部署，不挂载任何文件
 
-ui_print "- 一键重载模块 v2.2（自带 gs-reload-modules.sh）"
+ui_print "- 一键重载模块 v2.3-vector（自带 gs-reload-modules.sh）"
 ui_print "- 适用：三星 Galaxy Z Fold7（SM-F966B / One UI 9 / Android 17）"
 ui_print "- 特点：只重启 zygote，不执行 stop/start，折叠屏副屏不会掉"
 
@@ -16,6 +16,15 @@ if cp -f "$MODPATH/gs-reload-modules.sh" /data/adb/gs/gs-reload-modules.sh 2>/de
     ui_print "- 已备份到 /data/adb/gs/gs-reload-modules.sh"
 else
     ui_print "- [!] 备份到 /data/adb/gs 失败（不影响使用）"
+fi
+
+# Refresh the legacy terminal path on every installation/update as well. Runtime
+# copies never promote themselves over this package or the durable backup.
+mkdir -p /data/local/tmp 2>/dev/null
+if cp -f "$MODPATH/gs-reload-modules.sh" /data/local/tmp/gs-reload-modules.sh 2>/dev/null; then
+    chmod 755 /data/local/tmp/gs-reload-modules.sh 2>/dev/null
+else
+    ui_print "- [!] 旧终端路径更新失败；请使用模块目录里的脚本"
 fi
 
 mkdir -p /sdcard/GS/logs 2>/dev/null

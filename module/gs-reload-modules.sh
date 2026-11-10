@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# gs-reload-modules.sh  v22 — 让 KernelSU 模块生效，但不执行 stop/start
+# gs-reload-modules.sh  v23 — 让 KernelSU 模块生效，但不执行 stop/start
 # （随「一键重载模块 gs_quick_reload」一起分发，装在 /data/adb/modules/gs_quick_reload/）
 #
 # 背景：KernelSU 的「软重启」== ksud 的 soft_reboot()，实际序列是：
@@ -194,16 +194,8 @@ else
     LOGDIR=/data/local/tmp
     PERSIST=$LOGDIR/gs-reload.log
 fi
-if [ -f "$0" ] && [ "$0" != "$SELF_BAK" ]; then
-    cp -f "$0" "$SELF_BAK" 2>/dev/null && chmod 755 "$SELF_BAK" 2>/dev/null
-fi
-# v16：反向自愈 —— 若从 /data/adb/gs 启动而 tmp 副本被清（「悲伤压缩包」的
-#   隐藏 Root 功能会 chmod/rm -rf /data/local/tmp/*），把 tmp 副本补回来，
-#   这样模块「执行」按钮（调 /data/local/tmp/gs-reload-modules.sh）不会失效。
-if [ -f "$SELF_BAK" ] && [ ! -f /data/local/tmp/gs-reload-modules.sh ]; then
-    cp -f "$SELF_BAK" /data/local/tmp/gs-reload-modules.sh 2>/dev/null \
-        && chmod 755 /data/local/tmp/gs-reload-modules.sh 2>/dev/null
-fi
+# Copies are deployed by customize.sh during installation, never from $0 at
+# runtime. An exported or backup copy must not replace the installed version.
 
 # 落盘日志：追加一行带时间戳的记录（同时也打印到终端）
 tlog() {
@@ -408,6 +400,75 @@ restore_boot_state() {
         fi
     fi
     return 0
+}
+
+release_reload_lock() {
+    [ "${LOCK_HELD:-0}" = "1" ] || return 0
+    rmdir "$RELOAD_LOCK/parent" 2>/dev/null || true
+    if [ ! -d "$RELOAD_LOCK/night" ] && [ ! -d "$RELOAD_LOCK/boot" ]; then
+        rm -f "$RELOAD_LOCK/gate" "$RELOAD_LOCK/boot-id"
+        rmdir "$RELOAD_LOCK" 2>/dev/null || true
+    fi
+    LOCK_HELD=0
+}
+
+acquire_reload_lock() {
+    current_boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    [ -n "$current_boot" ] || return 1
+    # The kernel boot ID gives interrupted runs a fresh lock namespace after a
+    # full reboot, without racing to delete a lock that another run just took.
+    RELOAD_LOCK=$GS_DIR/.reload-lock-$current_boot
+    if ! mkdir "$RELOAD_LOCK" 2>/dev/null; then
+        echo "[X] Another reload or detached helper is active, or an interrupted run holds the lock."
+        echo "    Lock: $RELOAD_LOCK (a full reboot uses a fresh lock)."
+        return 1
+    fi
+    LOCK_HELD=1
+    mkdir "$RELOAD_LOCK/parent" || { release_reload_lock; return 1; }
+    printf '%s\n' "$current_boot" > "$RELOAD_LOCK/boot-id"
+    printf 'pending\n' > "$RELOAD_LOCK/gate"
+}
+
+cleanup_reload() {
+    restore_boot_state
+    if [ "${LOCK_HELD:-0}" = "1" ]; then
+        if [ "${BOOT_HANDOFF:-0}" = "1" ]; then
+            printf 'accepted\n' > "$RELOAD_LOCK/gate"
+        else
+            printf 'cancelled\n' > "$RELOAD_LOCK/gate"
+        fi
+        release_reload_lock
+    fi
+}
+
+# Helpers detach before restart so HUP cannot kill them, but do no work until
+# the restart is accepted. On a rejected request they exit without mutations.
+# Their markers keep the run lock alive until both helpers have finished.
+launch_restart_helper() {
+    helper_name=$1
+    shift
+    command -v setsid >/dev/null 2>&1 || return 1
+    mkdir "$RELOAD_LOCK/$helper_name" || return 1
+    setsid sh -c '
+        lock=$1; marker=$2; shift 2
+        done_helper() {
+            rmdir "$lock/$marker" 2>/dev/null || true
+            if [ ! -d "$lock/parent" ] && [ ! -d "$lock/night" ] && [ ! -d "$lock/boot" ]; then
+                rm -f "$lock/gate" "$lock/boot-id"
+                rmdir "$lock" 2>/dev/null || true
+            fi
+        }
+        trap done_helper 0
+        waited=0
+        while :; do
+            gate=$(cat "$lock/gate" 2>/dev/null) || exit 1
+            case "$gate" in accepted) break ;; cancelled) exit 0 ;; esac
+            [ "$waited" -lt 60 ] || exit 1
+            sleep 1
+            waited=$((waited+1))
+        done
+        "$@"
+    ' sh "$RELOAD_LOCK" "$helper_name" "$@" </dev/null >/dev/null 2>&1 &
 }
 # END framework helpers
 
@@ -683,7 +744,7 @@ fi
 # ------------------------------------------------------------------ run 模式
 if [ "$(id -u)" != "0" ]; then
     echo "[!] 需要 root。请在 GhostSam 内置终端里执行："
-    echo "      sh /data/local/tmp/gs-reload-modules.sh"
+    echo "      sh /data/adb/modules/gs_quick_reload/gs-reload-modules.sh"
     exit 1
 fi
 
@@ -737,6 +798,9 @@ if [ "$MODE" = "dump" ]; then
         echo "现有模块: $(ls "$MODDIR_BASE" 2>/dev/null | tr '\n' ' ')"
         exit 2
     fi
+    case "$DUMP_ID" in
+        *[!a-zA-Z0-9_.-]*|.|..) echo "[X] Invalid module id"; exit 2 ;;
+    esac
     _src="$MODDIR_BASE/$DUMP_ID"
     if [ ! -d "$_src" ]; then
         echo "[!] 没有这个目录: $_src"
@@ -778,7 +842,8 @@ dedupe_new() {
         echo "    --- dedupe $_dn: 清理本次新增 [$_new]（原有实例仍在，保留）"
         tlog "dedupe: $_dn 新增 [$_new] 已清理"
     else
-        _keep=$(echo $_new | awk '{print $NF}')
+        _keep=$(lspd_newest "$_new")
+        [ -n "$_keep" ] || { tlog "dedupe: no readable process start times; skipping $_dn"; return 0; }
         for p in $_new; do
             [ "$p" = "$_keep" ] && continue
             kill "$p" 2>/dev/null
@@ -807,7 +872,7 @@ socket_owner() {
                     # v17：只认**监听中**的 socket（/proc/net/unix 第 4 列 Flags=00010000）。
                     # v16 只比对 inode，结果把某个随便的 socket 当成了持有者，
                     # trim 掉真正的 zn-daemon 后 Zygisk 注入全部 111 拒绝。
-                    if awk -v i="$ino" '{for(k=1;k<=NF;k++) if($k==i && $4=="00010000"){f=1}} END{exit !f}' /proc/net/unix 2>/dev/null; then
+                    if awk -v i="$ino" '$7==i && $4=="00010000" {f=1} END{exit !f}' /proc/net/unix 2>/dev/null; then
                         echo "$p"; return 0
                     fi
                     ;;
@@ -853,7 +918,9 @@ trim_group() {
         [ "$p" = "$_keep" ] && continue
         [ -d "/proc/$p" ] && kill -9 "$p" 2>/dev/null
     done
-    echo "    --- 处理后：$(echo $_pids | wc -w) → $(pidof $_name 2>/dev/null | wc -w | tr -d ' ') 个"
+    _remaining=0
+    for p in $_pids; do [ -d "/proc/$p" ] && _remaining=$((_remaining+1)); done
+    echo "    --- 处理后：$(echo $_pids | wc -w) → $_remaining 个"
     return 0
 }
 
@@ -904,10 +971,12 @@ BOOT_ORIGINAL=$(getprop sys.boot_completed)
 BOOT_CHANGED=0
 BOOT_HANDOFF=0
 BOOT_RESETPROP=""
-trap 'restore_boot_state' 0
+LOCK_HELD=0
+trap 'cleanup_reload' 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+acquire_reload_lock || exit 3
 
 # 兜底：逐模块跑脚本（不做挂载）。输出同样走文件，避免后台 daemon 占住管道。
 run_one() {
@@ -1142,7 +1211,7 @@ night_watch_start() {
     _pd=$(dumpsys uimode 2>/dev/null | grep -o 'mComputedNightMode=[a-z]*' | head -1 | cut -d= -f2)
     [ -z "$_pd" ] && _pd=false
 
-    cat > "$NIGHT_HELPER" <<'EOS'
+    cat > "$NIGHT_HELPER" <<'EOS' || return 1
 #!/system/bin/sh
 # v21 夜间模式纠偏守护
 #   MODE = 用户原本的模式（0 自动 / 3 定时 / 1 浅色 / 2 深色）
@@ -1209,11 +1278,11 @@ else
 fi
 EOS
     chmod 755 "$NIGHT_HELPER" 2>/dev/null
-    setsid sh "$NIGHT_HELPER" "$_pm" "$_pd" "$LOGDIR/gs-night.log" </dev/null >/dev/null 2>&1 &
+    launch_restart_helper night sh "$NIGHT_HELPER" "$_pm" "$_pd" "$LOGDIR/gs-night.log" || return 1
     echo "    --- 已挂夜间模式守护：模式=$_pm 当前昼夜=$_pd（日志 $LOGDIR/gs-night.log）"
 }
 
-night_watch_start
+night_watch_start || exit 3
 
 # v13：boot_completed 看门狗（兼「边沿发生器」）。
 # 实测结论：`resetprop -w sys.boot_completed 1` 只在值发生 0→1 变化时被唤醒，
@@ -1224,11 +1293,12 @@ night_watch_start
 #   「还有没有 resetprop -w 卡着」—— 模块无关，喂到了等待者自己会退出。
 # 看门狗用 setsid 脱离会话，zygote 重启后依然存活。
 boot_watchdog_start() {
-    cat > "$BOOT_WD" <<'EOS'
+    _boot_written=1
+    cat > "$BOOT_WD" <<'EOS' || _boot_written=0
 #!/system/bin/sh
 LOG=${1:-/data/local/tmp/gs-boot-wd.log}
 WAITERS=${2:-}
-RP=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
+RP=$3
 log() { echo "[$(date +%m-%d' '%H:%M:%S)] $*" >> "$LOG"; chmod 644 "$LOG" 2>/dev/null; }
 perm() { p=$(stat -c %a "$1" 2>/dev/null); case "$p" in ''|*[!0-9]*) echo "$p" ;; *) printf "%03d" "$p" ;; esac; }
 blocked() {
@@ -1294,27 +1364,35 @@ log "结束：等待者残留=$(blocked)，/proc/modules=$(perm /proc/modules)�
 EOS
     chmod 755 "$BOOT_WD" 2>/dev/null
     _ws=$(boot_waiters | tr '\n' ' ')
+    _watch_rp=${BOOT_RESETPROP:-}
+    [ -n "$_watch_rp" ] || _watch_rp=$(command -v resetprop 2>/dev/null || echo /data/adb/ksu/bin/resetprop)
+    if [ ! -x "$_watch_rp" ]; then
+        tlog "[X] Cannot start boot watchdog: resetprop not executable: $_watch_rp"
+        return 1
+    fi
     # v18：先确认 helper 真的落盘了，否则启动只会静默失败（20:47 那次就丢了日志）
-    if [ ! -s "$BOOT_WD" ]; then
+    if [ "$_boot_written" = "0" ] || [ ! -f "$BOOT_WD" ] || [ ! -s "$BOOT_WD" ]; then
         echo "    [!] 看门狗脚本没写成（$BOOT_WD 为空），改走内联安全网"
         tlog "警告: $BOOT_WD 写入失败，退回内联安全网"
-        setsid sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && /data/adb/ksu/bin/resetprop sys.boot_completed 1' </dev/null >/dev/null 2>&1 &
+        launch_restart_helper boot sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && "$1" sys.boot_completed 1' sh "$_watch_rp" || return 1
         return 0
     fi
     if [ -z "$_ws" ]; then
         # 没有等待者时不需要边沿，只挂一条最小的安全网（卡 0 会拖到冷重启）
-        setsid sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && /data/adb/ksu/bin/resetprop sys.boot_completed 1' </dev/null >/dev/null 2>&1 &
+        launch_restart_helper boot sh -c 'sleep 90; [ "$(getprop sys.boot_completed)" = "0" ] && "$1" sys.boot_completed 1' sh "$_watch_rp" || return 1
         echo "    --- 无依赖 boot_completed 的模块，只挂 90s 安全网"
         tlog "watchdog: 无等待者，跳过边沿制造（仅安全网）"
         return 0
     fi
-    setsid sh "$BOOT_WD" "$LOGDIR/gs-boot-wd.log" "$_ws" </dev/null >>"$LOGDIR/gs-boot-wd.err" 2>&1 &
+    launch_restart_helper boot sh "$BOOT_WD" "$LOGDIR/gs-boot-wd.log" "$_ws" "$_watch_rp" || return 1
     echo "    --- 已挂 boot_completed 看门狗（等待模块：$_ws｜日志 $LOGDIR/gs-boot-wd.log）"
 }
 
 # Framework readiness was checked immediately after module stages, before any
 # night-mode helper was launched. An abort there runs restore_boot_state.
-[ "$DO_ZYGOTE" = "1" ] && boot_watchdog_start
+if [ "$DO_ZYGOTE" = "1" ]; then
+    boot_watchdog_start || exit 3
+fi
 
 echo "[*] 重启 zygote ..."
 tlog "下发 setprop ctl.restart zygote（累计 $(( $(date +%s) - T0 ))s）"

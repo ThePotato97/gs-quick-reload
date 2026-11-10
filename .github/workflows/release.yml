@@ -1,6 +1,6 @@
 # 用 KernelSU Modules 官方 release action 发布：
 # 校验 ZIP → 创建草稿 release → 上传 → 发布（保证 release 是 immutable）
-# 上线前建议把 @main 换成官方文档给出的完整 commit SHA
+# Pin release tooling to an immutable source revision.
 name: Release
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: KernelSU-Modules/tools/actions/module-release@main
+      - uses: KernelSU-Modules/tools/actions/module-release@606016adfbe4c286507ff6cd9bedaa74e1bff108
         with:
           module-dir: module
           release-notes-file: CHANGELOG.md
