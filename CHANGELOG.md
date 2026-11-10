@@ -1,5 +1,10 @@
 # 更新日志
 
+## v2.3.1 — Release metadata (versionCode 6)
+
+- Set the module version to `v2.3.1` with monotonically increasing `versionCode=6`.
+- Includes the reviewed Vector/NeoZygisk support and reload cleanup changes below.
+
 ## v2.3-vector — Vector support and reload cleanup (versionCode 5)
 
 - Detect Vector and NeoZygisk separately from LSPosed/Zygisk Next; probe the detected Vector APK directly with bounded IPC checks.
